@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+playwright
+pytesseract
+pillow
+deep-translator
+requests
+python-multipart
