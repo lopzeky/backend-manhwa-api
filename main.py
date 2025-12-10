@@ -9,6 +9,7 @@ import io
 
 app = FastAPI()
 
+# Configuración de permisos
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,12 +19,11 @@ app.add_middleware(
 )
 
 # --- CONFIGURACIÓN DE IDIOMAS ---
-# Aquí definimos las reglas para cada traducción
 CONFIG_IDIOMAS = {
-    "en_es": {"ocr": "eng", "src": "en", "dest": "es"}, # Inglés -> Español
-    "es_en": {"ocr": "spa", "src": "es", "dest": "en"}, # Español -> Inglés
-    "ko_es": {"ocr": "kor", "src": "ko", "dest": "es"}, # Coreano -> Español
-    "ko_en": {"ocr": "kor", "src": "ko", "dest": "en"}  # Coreano -> Inglés
+    "en_es": {"ocr": "eng", "src": "en", "dest": "es"},
+    "es_en": {"ocr": "spa", "src": "es", "dest": "en"},
+    "ko_es": {"ocr": "kor", "src": "ko", "dest": "es"},
+    "ko_en": {"ocr": "kor", "src": "ko", "dest": "en"}
 }
 
 @app.post("/scan")
@@ -38,14 +38,15 @@ def escanear_capitulo(payload: dict = Body(...)):
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
             
+            # Navegar con timeout de 60 segundos por si el sitio es lento
             try:
-                page.goto(url, timeout=40000, wait_until="domcontentloaded")
+                page.goto(url, timeout=60000, wait_until="domcontentloaded")
             except PlaywrightTimeout:
                 browser.close()
                 raise HTTPException(status_code=408, detail="El sitio web tardó demasiado en responder.")
             
-            # --- CORRECCIÓN DEL ERROR ROJO ---
-            # Eliminamos comentarios dentro del string de JS para evitar SyntaxError
+            # --- AQUÍ ESTABA EL ERROR (CORREGIDO) ---
+            # Este bloque es JavaScript puro y NO puede llevar comentarios con #
             imagenes = page.evaluate("""
                 () => {
                     return Array.from(document.querySelectorAll('img'))
@@ -68,27 +69,25 @@ def escanear_capitulo(payload: dict = Body(...)):
 @app.post("/traducir-imagen")
 def traducir_imagen(payload: dict = Body(...)):
     img_url = payload.get("img_url")
-    modo = payload.get("modo", "en_es") # Recibimos el modo elegido por el usuario
+    modo = payload.get("modo", "en_es")
 
-    # Cargamos la configuración (si no existe, usamos inglés->español por defecto)
     cfg = CONFIG_IDIOMAS.get(modo, CONFIG_IDIOMAS["en_es"])
 
     try:
-        response = requests.get(img_url, stream=True, timeout=10)
+        response = requests.get(img_url, stream=True, timeout=15)
         response.raise_for_status()
         img = Image.open(io.BytesIO(response.content))
 
-        # 1. Intentamos leer con el idioma seleccionado
+        # 1. OCR
         try:
             text = pytesseract.image_to_string(img, lang=cfg["ocr"])
         except:
-            # Si falla (ej: no está instalado el idioma), intentamos inglés
             text = pytesseract.image_to_string(img, lang="eng")
         
         if not text.strip():
             return {"texto_traducido": "(Sin texto detectado)"}
 
-        # 2. Traducimos
+        # 2. Traducir
         translator = GoogleTranslator(source=cfg["src"], target=cfg["dest"])
         traducido = translator.translate(text)
 
