@@ -6,11 +6,12 @@ from PIL import Image
 import io
 import gc
 from bs4 import BeautifulSoup
-# IMPORTANTE: Usamos curl_cffi en lugar de requests normal
 from curl_cffi import requests as cffi_requests
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 
 app = FastAPI()
 
+# Configuración de permisos para que Netlify se conecte
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,31 +27,31 @@ CONFIG_IDIOMAS = {
     "ko_en": {"ocr": "kor", "src": "ko", "dest": "en"}
 }
 
-# --- FUNCIÓN DE ESCANEO "NINJA" (CURL_CFFI) ---
+# --- FUNCIÓN DE DESCARGA RESILIENTE (CON REINTENTOS) ---
+# Si falla, intenta 3 veces, esperando 2 segundos entre intentos.
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
+def descargar_seguro(url, timeout=15):
+    # Cabeceras para parecer un humano real
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Referer": "https://www.google.com/"
+    }
+    # Usamos curl_cffi para imitar a Chrome 110
+    return cffi_requests.get(url, headers=headers, impersonate="chrome110", timeout=timeout)
+
+# --- ENDPOINT 1: ESCANEAR EL CAPÍTULO ---
 @app.post("/scan")
 def escanear_capitulo(payload: dict = Body(...)):
     url = payload.get("url")
     if not url:
         raise HTTPException(status_code=400, detail="Falta la URL")
     
-    print(f"🥷 Analizando con Camuflaje (curl_cffi): {url}")
+    print(f"🥷 Analizando con Tenacity + Curl_Cffi: {url}")
     
-    # Cabeceras estándar
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Referer": "https://www.google.com/"
-    }
-
     try:
-        # 1. Descargamos el HTML fingiendo ser Chrome 110 (impersonate)
-        # Esto salta la mayoría de protecciones Cloudflare básicas
-        response = cffi_requests.get(
-            url, 
-            headers=headers, 
-            impersonate="chrome110", 
-            timeout=15
-        )
+        # Usamos la función con reintentos automáticos
+        response = descargar_seguro(url)
         
         if response.status_code == 403:
             raise HTTPException(status_code=403, detail="Sitio protegido nivel Dios. Intenta con Manganato.")
@@ -58,42 +59,41 @@ def escanear_capitulo(payload: dict = Body(...)):
         if response.status_code != 200:
             raise HTTPException(status_code=400, detail=f"El sitio respondió con error: {response.status_code}")
 
-        # 2. Analizamos el HTML buscando imágenes
+        # Analizamos el HTML
         soup = BeautifulSoup(response.text, 'lxml')
         imagenes = []
 
         for img in soup.find_all('img'):
-            # Buscamos en atributos donde suelen esconder la imagen real (Lazy Load)
+            # Buscamos la imagen real en atributos lazy-load
             src = img.get('data-src') or img.get('data-original') or img.get('data-lazy-src') or img.get('src')
             
             if src:
                 src = src.strip()
-                # Corregir links que empiezan con //
-                if src.startswith('//'):
-                    src = 'https:' + src
+                if src.startswith('//'): src = 'https:' + src
                 
                 if src.startswith('http'):
                     src_lower = src.lower()
-                    # Filtros de basura (logos, anuncios)
+                    # Filtros anti-basura
                     if any(x in src_lower for x in ['logo', 'avatar', 'icon', 'banner', 'ads', 'facebook', 'twitter']):
                         continue
-                    
                     imagenes.append(src)
 
         # Eliminar duplicados
         imagenes_unicas = list(dict.fromkeys(imagenes))
 
         if len(imagenes_unicas) < 3:
-             raise HTTPException(status_code=422, detail="No encontré imágenes válidas. El sitio requiere Javascript complejo.")
+             raise HTTPException(status_code=422, detail="No encontré imágenes válidas (El sitio podría requerir JS complejo).")
 
         return {"status": "ok", "total": len(imagenes_unicas), "imagenes": imagenes_unicas}
 
     except Exception as e:
         print(f"Error: {e}")
+        # Si es un error HTTP que nosotros lanzamos, lo dejamos pasar
         if isinstance(e, HTTPException):
             raise e
-        raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error interno tras reintentos: {str(e)}")
 
+# --- ENDPOINT 2: TRADUCIR IMAGEN ---
 @app.post("/traducir-imagen")
 def traducir_imagen(payload: dict = Body(...)):
     img_url = payload.get("img_url")
@@ -101,39 +101,36 @@ def traducir_imagen(payload: dict = Body(...)):
     cfg = CONFIG_IDIOMAS.get(modo, CONFIG_IDIOMAS["en_es"])
 
     try:
-        # Usamos curl_cffi también aquí para que no bloqueen la descarga de la imagen
-        response = cffi_requests.get(
-            img_url, 
-            impersonate="chrome110", 
-            timeout=10
-        )
+        # Descargamos la imagen usando también la función blindada con reintentos
+        response = descargar_seguro(img_url, timeout=10)
         
         if response.status_code != 200:
             return {"texto_traducido": "(Error descargando imagen)"}
 
         img = Image.open(io.BytesIO(response.content))
         
-        # Optimización RAM (Blanco y Negro + Reducción)
-        img = img.convert('L')
+        # --- OPTIMIZACIÓN RAM (Crucial para servidor gratis) ---
+        img = img.convert('L') # Blanco y negro
         width, height = img.size
-        if width > 1500:
+        if width > 1500: # Reducir si es gigante
             ratio = 1500 / width
             new_height = int(height * ratio)
             img = img.resize((1500, new_height), Image.Resampling.LANCZOS)
 
-        # OCR
+        # OCR (Leer texto)
         try:
             text = pytesseract.image_to_string(img, lang=cfg["ocr"])
         except:
             text = pytesseract.image_to_string(img, lang="eng")
         
+        # Limpiar memoria
         del img
         gc.collect()
 
         if not text.strip():
             return {"texto_traducido": "(Sin texto detectado)"}
 
-        # Traducir
+        # Traducir (Google Translate)
         translator = GoogleTranslator(source=cfg["src"], target=cfg["dest"])
         traducido = translator.translate(text)
 
