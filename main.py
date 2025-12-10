@@ -28,17 +28,18 @@ CONFIG_IDIOMAS = {
 }
 
 # --- FUNCIÓN DE DESCARGA RESILIENTE (CON REINTENTOS) ---
-# Si falla, intenta 3 veces, esperando 2 segundos entre intentos.
+# --- FUNCIÓN DE DESCARGA RESILIENTE (MEJORADA) ---
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
 def descargar_seguro(url, timeout=15):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Referer": "https://www.google.com/"
-    }
-    # Usamos curl_cffi para imitar a Chrome 110 (Modo Ninja)
-    return cffi_requests.get(url, headers=headers, impersonate="chrome110", timeout=timeout)
-
+    # ELIMINAMOS las cabeceras manuales para evitar errores de huella digital.
+    # Dejamos que curl_cffi genere todo automáticamente.
+    
+    return cffi_requests.get(
+        url, 
+        # Actualizamos a una versión más reciente de Chrome
+        impersonate="chrome124", 
+        timeout=timeout
+    )
 # --- ENDPOINT 1: ESCANEAR ---
 @app.post("/scan")
 def escanear_capitulo(payload: dict = Body(...)):
@@ -127,3 +128,4 @@ def traducir_imagen(payload: dict = Body(...)):
 
     except Exception as e:
         return {"texto_traducido": f"Error: {str(e)}"}
+
