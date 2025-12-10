@@ -9,83 +9,76 @@ import io
 
 app = FastAPI()
 
-# Configurar CORS (Para que Netlify pueda hablar con este Backend)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # En producción cambiar esto por tu URL de Netlify
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- FUNCIÓN 1: ESCANEAR URL (Scraping Seguro) ---
+#     DICCIONARIO DE IDIOMAS 
+# Configura cómo debe comportarse la IA para cada opción
+CONFIG_IDIOMAS = {
+    "en_es": {"ocr": "eng", "src": "en", "dest": "es"}, # Inglés -> Español
+    "es_en": {"ocr": "spa", "src": "es", "dest": "en"}, # Español -> Inglés
+    "ko_es": {"ocr": "kor", "src": "ko", "dest": "es"}, # Coreano -> Español
+    "ko_en": {"ocr": "kor", "src": "ko", "dest": "en"}  # Coreano -> Inglés
+}
+
 @app.post("/scan")
 def escanear_capitulo(payload: dict = Body(...)):
     url = payload.get("url")
     if not url:
         raise HTTPException(status_code=400, detail="Falta la URL")
-
-    print(f"🌍 Analizando: {url}")
     
+    print(f"🌍 Analizando: {url}")
     with sync_playwright() as p:
         try:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
-            
-            # Navegar con timeout de 30 segs
             try:
-                response = page.goto(url, timeout=30000, wait_until="domcontentloaded")
+                page.goto(url, timeout=40000, wait_until="domcontentloaded")
             except PlaywrightTimeout:
                 browser.close()
-                raise HTTPException(status_code=408, detail="El sitio web tardó mucho en responder. Intenta otro.")
+                raise HTTPException(status_code=408, detail="Timeout: El sitio tardó mucho.")
             
-            # Verificar Bloqueos Anti-Bot
-            if "Just a moment" in page.title() or response.status == 403:
-                browser.close()
-                raise HTTPException(status_code=403, detail="Sitio protegido contra bots (Cloudflare). Prueba otra web.")
-
-            # Extraer imágenes grandes (filtro anti-iconos)
+            # Script para sacar imágenes (filtro mejorado)
             imagenes = page.evaluate("""
                 () => {
                     return Array.from(document.querySelectorAll('img'))
-                        .filter(img => img.naturalWidth > 400) # Solo imágenes anchas
+                        .filter(img => img.naturalWidth > 300 && img.src.startsWith('http'))
                         .map(img => img.src)
                 }
             """)
-            
             browser.close()
-            
-            if not imagenes:
-                raise HTTPException(status_code=422, detail="No encontré imágenes de manhwa. El sitio puede ser incompatible.")
-
             return {"status": "ok", "total": len(imagenes), "imagenes": imagenes}
-
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
-# --- FUNCIÓN 2: TRADUCIR UNA IMAGEN ---
 @app.post("/traducir-imagen")
 def traducir_imagen(payload: dict = Body(...)):
     img_url = payload.get("img_url")
-    idioma_destino = payload.get("lang", "es") # Por defecto español
-    
+    modo = payload.get("modo", "en_es") # Por defecto Inglés a Español
+
+    # Cargar configuración según el modo seleccionado
+    cfg = CONFIG_IDIOMAS.get(modo, CONFIG_IDIOMAS["en_es"])
+
     try:
-        # 1. Descargar la imagen
         response = requests.get(img_url, stream=True)
-        response.raise_for_status()
         img = Image.open(io.BytesIO(response.content))
 
-        # 2. OCR (Leer Texto)
-        text = pytesseract.image_to_string(img)
+        # 1. OCR usando el idioma correcto (eng, spa, o kor)
+        text = pytesseract.image_to_string(img, lang=cfg["ocr"])
         
         if not text.strip():
-            return {"texto_original": "", "texto_traducido": "(Sin texto detectado)"}
+            return {"texto_traducido": "(Sin texto detectado)"}
 
-        # 3. Traducir
-        translator = GoogleTranslator(source='auto', target=idioma_destino)
+        # 2. Traducir usando origen y destino correctos
+        translator = GoogleTranslator(source=cfg["src"], target=cfg["dest"])
         traducido = translator.translate(text)
 
         return {"texto_original": text, "texto_traducido": traducido}
 
     except Exception as e:
-        return {"error": str(e)}
+        return {"texto_traducido": f"Error: {str(e)}"}
