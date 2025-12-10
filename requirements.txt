@@ -6,3 +6,5 @@ pillow
 deep-translator
 requests
 python-multipart
+beautifulsoup4
+lxml
