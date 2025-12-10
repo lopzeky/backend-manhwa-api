@@ -33,72 +33,67 @@ def escanear_capitulo(payload: dict = Body(...)):
     if not url:
         raise HTTPException(status_code=400, detail="Falta la URL")
     
-    print(f"🌍 Analizando (Modo Humano): {url}")
+    print(f"🌍 Analizando (Modo Ciego): {url}")
     
-    # 1. Argumentos para ahorrar RAM en Render (Vital para 512MB)
     chrome_args = [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-accelerated-2d-canvas",
-        "--no-first-run",
-        "--no-zygote",
-        "--single-process",
-        "--disable-gpu"
+        "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
+        "--disable-accelerated-2d-canvas", "--no-first-run", "--no-zygote",
+        "--single-process", "--disable-gpu"
     ]
 
     with sync_playwright() as p:
         try:
-            # Lanzamos el navegador
             browser = p.chromium.launch(headless=True, args=chrome_args)
-            
-            # 2. EL CABALLO DE TROYA: Configuración de "Humano Real"
             context = browser.new_context(
-                # Fingimos ser un PC con Windows 10 y Chrome reciente
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                # Tamaño de pantalla de laptop estándar
-                viewport={"width": 1366, "height": 768},
-                # Idioma y zona horaria de Chile (para parecer local)
-                locale="es-CL",
-                timezone_id="America/Santiago",
-                # Cabeceras HTTP extra para dar confianza
-                extra_http_headers={
-                    "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
-                    "Referer": "https://www.google.com/"  # Fingimos venir de Google
-                }
+                viewport={"width": 1280, "height": 720}
             )
-            
             page = context.new_page()
             
-            # Bloqueo de recursos pesados para ahorrar RAM (No cargamos CSS/Fuentes/Imágenes del sitio, solo el HTML)
-            page.route("**/*", lambda route: route.continue_() if route.request.resource_type in ["document", "script", "xhr", "fetch"] else route.abort())
+            # Bloquear fuentes y CSS para ir más rápido, pero permitimos imágenes para que existan en el DOM
+            page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["font", "stylesheet"] else route.continue_())
 
-            # Tiempo de espera largo (60s) porque Render gratis es lento
             try:
                 page.goto(url, timeout=60000, wait_until="domcontentloaded")
+                # Esperamos un poco extra para que el sitio cargue el HTML dinámico
+                page.wait_for_timeout(3000) 
             except PlaywrightTimeout:
                 browser.close()
-                raise HTTPException(status_code=408, detail="El sitio tardó mucho en responder (Timeout).")
+                raise HTTPException(status_code=408, detail="El sitio tardó mucho en responder.")
             
-            # Script de extracción limpio (sin comentarios para evitar SyntaxError)
+            # --- CAMBIO IMPORTANTE: MODO CIEGO ---
+            # Ya no medimos el ancho (naturalWidth) porque el servidor es lento.
+            # Solo pedimos todas las etiquetas <img> que tengan src.
             imagenes = page.evaluate("""
                 () => {
                     return Array.from(document.querySelectorAll('img'))
-                        .filter(img => img.src.startsWith('http'))
                         .map(img => img.src)
+                        .filter(src => src.startsWith('http'))
                 }
             """)
             
             browser.close()
-            gc.collect() # Limpiamos RAM
-            
-            # Filtro de seguridad en Python
-            imagenes_limpias = [img for img in imagenes if len(img) > 10]
+            gc.collect()
 
-            if not imagenes_limpias:
+            # --- FILTRADO EN PYTHON (Más rápido) ---
+            # Eliminamos basura (logos, iconos, avatares) basándonos en palabras clave
+            palabras_basura = ['logo', 'icon', 'avatar', 'thumb', 'banner', 'facebook', 'twitter', 'discord']
+            imagenes_limpias = []
+            
+            for img in imagenes:
+                # Si contiene alguna palabra basura, la saltamos
+                if any(basura in img.lower() for basura in palabras_basura):
+                    continue
+                # Si parece una imagen válida, la guardamos
+                imagenes_limpias.append(img)
+
+            # Eliminamos duplicados manteniendo el orden
+            imagenes_unicas = list(dict.fromkeys(imagenes_limpias))
+
+            if not imagenes_unicas:
                 raise HTTPException(status_code=422, detail="No pude detectar imágenes. El sitio tiene protección avanzada.")
 
-            return {"status": "ok", "total": len(imagenes_limpias), "imagenes": imagenes_limpias}
+            return {"status": "ok", "total": len(imagenes_unicas), "imagenes": imagenes_unicas}
 
         except Exception as e:
             print(f"Error: {e}")
@@ -150,3 +145,4 @@ def traducir_imagen(payload: dict = Body(...)):
 
     except Exception as e:
         return {"texto_traducido": f"Error: {str(e)}"}
+
