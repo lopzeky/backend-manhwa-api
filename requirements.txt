@@ -8,3 +8,4 @@ requests
 python-multipart
 beautifulsoup4
 lxml
+curl_cffi
