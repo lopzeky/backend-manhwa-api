@@ -7,11 +7,11 @@ import io
 import gc
 from bs4 import BeautifulSoup
 from curl_cffi import requests as cffi_requests
-from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_fixed
 
 app = FastAPI()
 
-# Configuración de permisos para que Netlify se conecte
+# Configuración de permisos
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,16 +31,15 @@ CONFIG_IDIOMAS = {
 # Si falla, intenta 3 veces, esperando 2 segundos entre intentos.
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
 def descargar_seguro(url, timeout=15):
-    # Cabeceras para parecer un humano real
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Referer": "https://www.google.com/"
     }
-    # Usamos curl_cffi para imitar a Chrome 110
+    # Usamos curl_cffi para imitar a Chrome 110 (Modo Ninja)
     return cffi_requests.get(url, headers=headers, impersonate="chrome110", timeout=timeout)
 
-# --- ENDPOINT 1: ESCANEAR EL CAPÍTULO ---
+# --- ENDPOINT 1: ESCANEAR ---
 @app.post("/scan")
 def escanear_capitulo(payload: dict = Body(...)):
     url = payload.get("url")
@@ -50,21 +49,19 @@ def escanear_capitulo(payload: dict = Body(...)):
     print(f"🥷 Analizando con Tenacity + Curl_Cffi: {url}")
     
     try:
-        # Usamos la función con reintentos automáticos
+        # Usamos la función inteligente que reintenta si falla
         response = descargar_seguro(url)
         
         if response.status_code == 403:
-            raise HTTPException(status_code=403, detail="Sitio protegido nivel Dios. Intenta con Manganato.")
+            raise HTTPException(status_code=403, detail="Sitio protegido. Intenta con Manganato.")
         
         if response.status_code != 200:
             raise HTTPException(status_code=400, detail=f"El sitio respondió con error: {response.status_code}")
 
-        # Analizamos el HTML
         soup = BeautifulSoup(response.text, 'lxml')
         imagenes = []
 
         for img in soup.find_all('img'):
-            # Buscamos la imagen real en atributos lazy-load
             src = img.get('data-src') or img.get('data-original') or img.get('data-lazy-src') or img.get('src')
             
             if src:
@@ -73,27 +70,23 @@ def escanear_capitulo(payload: dict = Body(...)):
                 
                 if src.startswith('http'):
                     src_lower = src.lower()
-                    # Filtros anti-basura
                     if any(x in src_lower for x in ['logo', 'avatar', 'icon', 'banner', 'ads', 'facebook', 'twitter']):
                         continue
                     imagenes.append(src)
 
-        # Eliminar duplicados
         imagenes_unicas = list(dict.fromkeys(imagenes))
 
         if len(imagenes_unicas) < 3:
-             raise HTTPException(status_code=422, detail="No encontré imágenes válidas (El sitio podría requerir JS complejo).")
+             raise HTTPException(status_code=422, detail="No encontré imágenes válidas.")
 
         return {"status": "ok", "total": len(imagenes_unicas), "imagenes": imagenes_unicas}
 
     except Exception as e:
         print(f"Error: {e}")
-        # Si es un error HTTP que nosotros lanzamos, lo dejamos pasar
-        if isinstance(e, HTTPException):
-            raise e
-        raise HTTPException(status_code=500, detail=f"Error interno tras reintentos: {str(e)}")
+        if isinstance(e, HTTPException): raise e
+        raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
 
-# --- ENDPOINT 2: TRADUCIR IMAGEN ---
+# --- ENDPOINT 2: TRADUCIR ---
 @app.post("/traducir-imagen")
 def traducir_imagen(payload: dict = Body(...)):
     img_url = payload.get("img_url")
@@ -101,7 +94,6 @@ def traducir_imagen(payload: dict = Body(...)):
     cfg = CONFIG_IDIOMAS.get(modo, CONFIG_IDIOMAS["en_es"])
 
     try:
-        # Descargamos la imagen usando también la función blindada con reintentos
         response = descargar_seguro(img_url, timeout=10)
         
         if response.status_code != 200:
@@ -109,28 +101,25 @@ def traducir_imagen(payload: dict = Body(...)):
 
         img = Image.open(io.BytesIO(response.content))
         
-        # --- OPTIMIZACIÓN RAM (Crucial para servidor gratis) ---
-        img = img.convert('L') # Blanco y negro
+        # Optimización RAM
+        img = img.convert('L')
         width, height = img.size
-        if width > 1500: # Reducir si es gigante
+        if width > 1500:
             ratio = 1500 / width
             new_height = int(height * ratio)
             img = img.resize((1500, new_height), Image.Resampling.LANCZOS)
 
-        # OCR (Leer texto)
         try:
             text = pytesseract.image_to_string(img, lang=cfg["ocr"])
         except:
             text = pytesseract.image_to_string(img, lang="eng")
         
-        # Limpiar memoria
         del img
         gc.collect()
 
         if not text.strip():
             return {"texto_traducido": "(Sin texto detectado)"}
 
-        # Traducir (Google Translate)
         translator = GoogleTranslator(source=cfg["src"], target=cfg["dest"])
         traducido = translator.translate(text)
 
