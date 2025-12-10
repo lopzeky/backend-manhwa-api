@@ -1,11 +1,9 @@
+curl_cffi
 fastapi
 uvicorn
-playwright
 pytesseract
 pillow
 deep-translator
-requests
 python-multipart
 beautifulsoup4
 lxml
-curl_cffi
