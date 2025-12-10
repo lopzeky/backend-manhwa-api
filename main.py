@@ -3,10 +3,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from deep_translator import GoogleTranslator
 import pytesseract
 from PIL import Image
-import requests
 import io
 import gc
-from bs4 import BeautifulSoup # Importamos la nueva herramienta ligera
+from bs4 import BeautifulSoup
+# IMPORTANTE: Usamos curl_cffi en lugar de requests normal
+from curl_cffi import requests as cffi_requests
 
 app = FastAPI()
 
@@ -25,29 +26,34 @@ CONFIG_IDIOMAS = {
     "ko_en": {"ocr": "kor", "src": "ko", "dest": "en"}
 }
 
-# --- NUEVA FUNCIÓN DE ESCANEO LIGERO (SIN CHROME) ---
+# --- FUNCIÓN DE ESCANEO "NINJA" (CURL_CFFI) ---
 @app.post("/scan")
 def escanear_capitulo(payload: dict = Body(...)):
     url = payload.get("url")
     if not url:
         raise HTTPException(status_code=400, detail="Falta la URL")
     
-    print(f"🌍 Analizando (Modo Ligero): {url}")
+    print(f"🥷 Analizando con Camuflaje (curl_cffi): {url}")
     
-    # Cabeceras para parecer un humano real (Vital para que no nos bloqueen)
+    # Cabeceras estándar
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
         "Referer": "https://www.google.com/"
     }
 
     try:
-        # 1. Descargamos solo el código HTML (Muy rápido)
-        response = requests.get(url, headers=headers, timeout=15)
+        # 1. Descargamos el HTML fingiendo ser Chrome 110 (impersonate)
+        # Esto salta la mayoría de protecciones Cloudflare básicas
+        response = cffi_requests.get(
+            url, 
+            headers=headers, 
+            impersonate="chrome110", 
+            timeout=15
+        )
         
         if response.status_code == 403:
-            raise HTTPException(status_code=403, detail="Sitio protegido por Cloudflare. Intenta con Manganato o ManhwaClan.")
+            raise HTTPException(status_code=403, detail="Sitio protegido nivel Dios. Intenta con Manganato.")
         
         if response.status_code != 200:
             raise HTTPException(status_code=400, detail=f"El sitio respondió con error: {response.status_code}")
@@ -56,32 +62,34 @@ def escanear_capitulo(payload: dict = Body(...)):
         soup = BeautifulSoup(response.text, 'lxml')
         imagenes = []
 
-        # Buscamos todas las etiquetas <img>
         for img in soup.find_all('img'):
-            # Truco: Muchos sitios ocultan la imagen real en 'data-src' o 'data-original'
-            src = img.get('data-src') or img.get('data-original') or img.get('src')
+            # Buscamos en atributos donde suelen esconder la imagen real (Lazy Load)
+            src = img.get('data-src') or img.get('data-original') or img.get('data-lazy-src') or img.get('src')
             
-            if src and src.startswith('http'):
-                # Filtros de basura
-                src_lower = src.lower()
-                if any(x in src_lower for x in ['logo', 'avatar', 'icon', 'banner', 'ads', 'facebook', 'twitter']):
-                    continue
+            if src:
+                src = src.strip()
+                # Corregir links que empiezan con //
+                if src.startswith('//'):
+                    src = 'https:' + src
                 
-                imagenes.append(src)
+                if src.startswith('http'):
+                    src_lower = src.lower()
+                    # Filtros de basura (logos, anuncios)
+                    if any(x in src_lower for x in ['logo', 'avatar', 'icon', 'banner', 'ads', 'facebook', 'twitter']):
+                        continue
+                    
+                    imagenes.append(src)
 
-        # Eliminar duplicados manteniendo orden
+        # Eliminar duplicados
         imagenes_unicas = list(dict.fromkeys(imagenes))
 
-        # Validación final
         if len(imagenes_unicas) < 3:
-             # Si encontramos muy pocas, quizás es porque el sitio usa JS complejo
-             raise HTTPException(status_code=422, detail="No encontré imágenes. Este sitio requiere un navegador completo (Plan Pro).")
+             raise HTTPException(status_code=422, detail="No encontré imágenes válidas. El sitio requiere Javascript complejo.")
 
         return {"status": "ok", "total": len(imagenes_unicas), "imagenes": imagenes_unicas}
 
     except Exception as e:
         print(f"Error: {e}")
-        # Si ya es un HTTPException, lo dejamos pasar
         if isinstance(e, HTTPException):
             raise e
         raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
@@ -93,14 +101,19 @@ def traducir_imagen(payload: dict = Body(...)):
     cfg = CONFIG_IDIOMAS.get(modo, CONFIG_IDIOMAS["en_es"])
 
     try:
-        # Headers para descargar la imagen sin ser bloqueado
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        response = requests.get(img_url, headers=headers, stream=True, timeout=10)
-        response.raise_for_status()
+        # Usamos curl_cffi también aquí para que no bloqueen la descarga de la imagen
+        response = cffi_requests.get(
+            img_url, 
+            impersonate="chrome110", 
+            timeout=10
+        )
         
+        if response.status_code != 200:
+            return {"texto_traducido": "(Error descargando imagen)"}
+
         img = Image.open(io.BytesIO(response.content))
         
-        # Optimización RAM
+        # Optimización RAM (Blanco y Negro + Reducción)
         img = img.convert('L')
         width, height = img.size
         if width > 1500:
