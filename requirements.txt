@@ -1,6 +1,7 @@
-curl_cffi
 fastapi
 uvicorn
+curl_cffi
+tenacity
 pytesseract
 pillow
 deep-translator
