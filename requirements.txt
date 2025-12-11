@@ -2,8 +2,6 @@ fastapi
 uvicorn
 requests
 tenacity
-pytesseract
-pillow
 deep-translator
 python-multipart
 beautifulsoup4
