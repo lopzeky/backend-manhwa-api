@@ -5,13 +5,12 @@ import pytesseract
 from PIL import Image
 import io
 import gc
+import requests # Usamos requests normal porque ZenRows hace la magia
 from bs4 import BeautifulSoup
-from curl_cffi import requests as cffi_requests
 from tenacity import retry, stop_after_attempt, wait_fixed
 
 app = FastAPI()
 
-# Configuración de permisos
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,19 +26,30 @@ CONFIG_IDIOMAS = {
     "ko_en": {"ocr": "kor", "src": "ko", "dest": "en"}
 }
 
-# --- FUNCIÓN DE DESCARGA RESILIENTE (CON REINTENTOS) ---
-# --- FUNCIÓN DE DESCARGA RESILIENTE (MEJORADA) ---
+# --- FUNCIÓN DE DESCARGA MAESTRA (USANDO ZENROWS) ---
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
-def descargar_seguro(url, timeout=15):
-    # ELIMINAMOS las cabeceras manuales para evitar errores de huella digital.
-    # Dejamos que curl_cffi genere todo automáticamente.
+def descargar_con_zenrows(url, timeout=30):
     
-    return cffi_requests.get(
-        url, 
-        # Actualizamos a una versión más reciente de Chrome
-        impersonate="chrome124", 
-        timeout=timeout
-    )
+    # 🔴🔴🔴 PEGA TU API KEY DE ZENROWS AQUÍ 🔴🔴🔴
+    API_KEY = "16ec4b42117e5328f574d7cf53b32bbbb17daa75"
+    
+    # Configuración: js_render=true (vital para sitios modernos) y premium_proxy=true (anti-bloqueo)
+    params = {
+        "apikey": API_KEY,
+        "url": url,
+        "js_render": "true",
+        "premium_proxy": "true",
+        "wait": "2000" # Esperar 2 segundos a que cargue el sitio
+    }
+
+    try:
+        # Llamamos a ZenRows en lugar del sitio directo
+        response = requests.get("https://api.zenrows.com/v1/", params=params, timeout=timeout)
+        return response
+    except Exception as e:
+        print(f"Error conectando con ZenRows: {e}")
+        raise e
+
 # --- ENDPOINT 1: ESCANEAR ---
 @app.post("/scan")
 def escanear_capitulo(payload: dict = Body(...)):
@@ -47,22 +57,22 @@ def escanear_capitulo(payload: dict = Body(...)):
     if not url:
         raise HTTPException(status_code=400, detail="Falta la URL")
     
-    print(f"🥷 Analizando con Tenacity + Curl_Cffi: {url}")
+    print(f"🚀 Enviando a ZenRows: {url}")
     
     try:
-        # Usamos la función inteligente que reintenta si falla
-        response = descargar_seguro(url)
+        # Usamos la API de ZenRows
+        response = descargar_con_zenrows(url)
         
-        if response.status_code == 403:
-            raise HTTPException(status_code=403, detail="Sitio protegido. Intenta con Manganato.")
-        
+        # ZenRows devuelve 403 si falla él, o si el sitio lo bloquea a él
         if response.status_code != 200:
-            raise HTTPException(status_code=400, detail=f"El sitio respondió con error: {response.status_code}")
+            print(f"Error ZenRows: {response.text}")
+            raise HTTPException(status_code=400, detail=f"No pude acceder. ZenRows dice: {response.status_code}")
 
         soup = BeautifulSoup(response.text, 'lxml')
         imagenes = []
 
         for img in soup.find_all('img'):
+            # Buscamos atributos de lazy load
             src = img.get('data-src') or img.get('data-original') or img.get('data-lazy-src') or img.get('src')
             
             if src:
@@ -71,6 +81,7 @@ def escanear_capitulo(payload: dict = Body(...)):
                 
                 if src.startswith('http'):
                     src_lower = src.lower()
+                    # Filtros básicos
                     if any(x in src_lower for x in ['logo', 'avatar', 'icon', 'banner', 'ads', 'facebook', 'twitter']):
                         continue
                     imagenes.append(src)
@@ -78,7 +89,7 @@ def escanear_capitulo(payload: dict = Body(...)):
         imagenes_unicas = list(dict.fromkeys(imagenes))
 
         if len(imagenes_unicas) < 3:
-             raise HTTPException(status_code=422, detail="No encontré imágenes válidas.")
+             raise HTTPException(status_code=422, detail="ZenRows entró, pero no encontró imágenes (el sitio puede tener estructura rara).")
 
         return {"status": "ok", "total": len(imagenes_unicas), "imagenes": imagenes_unicas}
 
@@ -95,10 +106,16 @@ def traducir_imagen(payload: dict = Body(...)):
     cfg = CONFIG_IDIOMAS.get(modo, CONFIG_IDIOMAS["en_es"])
 
     try:
-        response = descargar_seguro(img_url, timeout=10)
-        
-        if response.status_code != 200:
-            return {"texto_traducido": "(Error descargando imagen)"}
+        # Para descargar la IMAGEN, intentamos directo primero (para ahorrar créditos de ZenRows)
+        # Fingimos ser Chrome normal
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        try:
+            response = requests.get(img_url, headers=headers, stream=True, timeout=10)
+            response.raise_for_status()
+        except:
+            # Si falla directo, usamos ZenRows como respaldo (gasta créditos)
+            print("Fallo directo, usando ZenRows para imagen...")
+            response = descargar_con_zenrows(img_url)
 
         img = Image.open(io.BytesIO(response.content))
         
@@ -128,4 +145,3 @@ def traducir_imagen(payload: dict = Body(...)):
 
     except Exception as e:
         return {"texto_traducido": f"Error: {str(e)}"}
-
