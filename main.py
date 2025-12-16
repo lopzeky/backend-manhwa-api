@@ -179,28 +179,30 @@ def traducir_imagen(payload: dict = Body(...)):
         img = Image.open(io.BytesIO(response.content))
         img = img.convert('L')
         
-        # IMPORTANTE: Redimensionamos a 1500px para estandarizar coordenadas
+        # 1. REDIMENSIONAR (Estandarizamos a 1500px de ancho para mejor OCR)
         target_width = 1500
         original_width, original_height = img.size
         
         if original_width > target_width:
             ratio = target_width / original_width
-            img = img.resize((target_width, int(original_height * ratio)), Image.Resampling.LANCZOS)
-        else:
-            ratio = 1.0 # No se redimensionó
+            new_height = int(original_height * ratio)
+            img = img.resize((target_width, new_height), Image.Resampling.LANCZOS)
+        
+        # 2. GUARDAMOS LAS DIMENSIONES REALES USADAS PARA EL OCR
+        ancho_final, alto_final = img.size
 
-        # OCR devuelve objetos con coordenadas
+        # 3. OCR
         try:
             lista_bloques = procesar_ocr_inteligente(img, cfg["ocr"])
         except:
-            lista_bloques = procesar_ocr_inteligente(img, "eng") # Fallback
+            lista_bloques = procesar_ocr_inteligente(img, "eng")
         
         del img
         gc.collect()
 
         if not lista_bloques: return {"bloques": []}
 
-        # Extraemos texto para traducir
+        # 4. TRADUCCIÓN
         textos = [b['texto'] for b in lista_bloques]
         texto_unido = " ||| ".join(textos)
         
@@ -209,7 +211,7 @@ def traducir_imagen(payload: dict = Body(...)):
             traduccion_raw = translator.translate(texto_unido)
             lista_traducida = traduccion_raw.split(" ||| ")
         except:
-            lista_traducida = textos # Si falla, devuelve original
+            lista_traducida = textos
 
         resultado_final = []
         limit = min(len(lista_bloques), len(lista_traducida))
@@ -220,13 +222,18 @@ def traducir_imagen(payload: dict = Body(...)):
                 resultado_final.append({
                     "original": lista_bloques[i]['texto'],
                     "traducido": trad,
-                    # Devolvemos coordenadas y el factor de escala usado
-                    "coords": lista_bloques[i]['box'],
-                    "img_scale": ratio 
+                    "coords": lista_bloques[i]['box']
                 })
 
-        return {"bloques": resultado_final}
+        # DEVOLVEMOS LOS DATOS + LAS DIMENSIONES DE REFERENCIA
+        return {
+            "bloques": resultado_final,
+            "ref_w": ancho_final,  # <--- ESTO ES LA CLAVE
+            "ref_h": alto_final    # <--- ESTO ES LA CLAVE
+        }
 
     except Exception as e:
         print(f"Error: {e}")
         return {"bloques": [], "error": str(e)}
+        return {"bloques": [], "error": str(e)}
+
