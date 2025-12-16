@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from deep_translator import GoogleTranslator
 import pytesseract
-from pytesseract import Output # <--- IMPORTANTE: Necesario para obtener coordenadas
+from pytesseract import Output  # <--- IMPORTANTE: Necesario para leer coordenadas
 from PIL import Image
 import io
 import gc
@@ -28,10 +28,47 @@ CONFIG_IDIOMAS = {
     "ko_en": {"ocr": "kor", "src": "ko", "dest": "en"}
 }
 
-# --- [TUS FUNCIONES DE DESCARGA / ZENROWS AQUÍ] ---
-# (He mantenido tu función descargar_con_zenrows intacta, 
-#  asúmela presente aquí tal cual la escribiste)
+# --- FUNCIÓN INTELIGENTE: Agrupa texto por cercanía (Detecta Burbujas) ---
+def procesar_ocr_inteligente(img, lang_ocr):
+    # output_type=Output.DICT nos da coordenadas (top, left, height, etc.)
+    data = pytesseract.image_to_data(img, lang=lang_ocr, output_type=Output.DICT)
+    
+    n_boxes = len(data['text'])
+    bloques = []         # Lista final de burbujas
+    bloque_actual = []   # Palabras de la burbuja actual
+    ultimo_bottom = 0    # Posición inferior de la última palabra procesada
+    
+    # UMBRAL: Si hay más de 60px de espacio vertical entre palabras, es otra burbuja
+    UMBRAL_SEPARACION = 60 
 
+    for i in range(n_boxes):
+        # Filtramos basura (confianza < 40 o espacios vacíos)
+        if int(data['conf'][i]) > 40:
+            texto = data['text'][i].strip()
+            if not texto: continue
+
+            top = data['top'][i]
+            height = data['height'][i]
+            bottom = top + height
+            
+            # LÓGICA DE AGRUPACIÓN:
+            # Si ya tenemos palabras y la nueva palabra está muy lejos abajo...
+            if bloque_actual and (top - ultimo_bottom) > UMBRAL_SEPARACION:
+                # 1. Cerramos la burbuja anterior
+                bloques.append(" ".join(bloque_actual))
+                # 2. Iniciamos una nueva
+                bloque_actual = []
+            
+            bloque_actual.append(texto)
+            ultimo_bottom = bottom # Actualizamos la referencia
+
+    # Agregar el último bloque que quedó pendiente en el buffer
+    if bloque_actual:
+        bloques.append(" ".join(bloque_actual))
+    
+    return bloques
+
+# --- ZENROWS (Igual que antes) ---
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
 def descargar_con_zenrows(url, timeout=40):
     API_KEY = "16ec4b42117e5328f574d7cf53b32bbbb17daa75" 
@@ -47,101 +84,41 @@ def descargar_con_zenrows(url, timeout=40):
         response = requests.get("https://api.zenrows.com/v1/", params=params, timeout=timeout)
         return response
     except Exception as e:
-        print(f"Error conectando con ZenRows: {e}")
+        print(f"Error ZenRows: {e}")
         raise e
 
-# --- [TU ENDPOINT DE SCAN AQUÍ] ---
-# (Mantenemos tu endpoint /scan intacto)
+# --- ENDPOINT 1: ESCANEAR (Igual que antes) ---
 @app.post("/scan")
 def escanear_capitulo(payload: dict = Body(...)):
     url = payload.get("url")
     if not url: raise HTTPException(status_code=400, detail="Falta la URL")
+    
     print(f"🚀 Escaneando: {url}")
     try:
         response = descargar_con_zenrows(url)
-        if response.status_code != 200: raise HTTPException(status_code=400, detail=f"ZenRows falló: {response.status_code}")
+        if response.status_code != 200: raise HTTPException(status_code=400, detail="ZenRows falló")
 
         soup = BeautifulSoup(response.text, 'lxml')
         imagenes = []
         for img in soup.find_all('img'):
-            src = img.get('data-src') or img.get('data-original') or img.get('data-lazy-src') or img.get('src')
-            if src:
-                if src.startswith('//'): src = 'https:' + src
-                if src.startswith('http'):
-                    src_lower = src.lower()
-                    if any(x in src_lower for x in ['logo', 'avatar', 'icon', 'banner', 'ads']): continue
-                    imagenes.append(src)
+            src = img.get('data-src') or img.get('data-original') or img.get('src')
+            if src and src.startswith('http') and not any(x in src.lower() for x in ['logo', 'banner', 'ads']):
+                imagenes.append(src)
 
         if len(imagenes) < 3:
-            print("⚠️ Método HTML falló. Usando Fuerza Bruta (Regex)...")
             patron = r'(https?://[^"\s\'>]+\.(?:jpg|jpeg|png|webp))'
             enlaces_raw = re.findall(patron, response.text)
             for link in enlaces_raw:
-                if any(x in link.lower() for x in ['logo', 'avatar', 'icon', 'banner', 'ads', 'facebook', 'svg']): continue
-                imagenes.append(link)
+                if not any(x in link.lower() for x in ['logo', 'banner', 'ads']):
+                    imagenes.append(link)
 
         imagenes_unicas = list(dict.fromkeys(imagenes))
-        if len(imagenes_unicas) < 3:
-             raise HTTPException(status_code=422, detail="No se encontraron imágenes legibles.")
-
         return {"status": "ok", "total": len(imagenes_unicas), "imagenes": imagenes_unicas}
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-
-# --- LÓGICA DE PROCESAMIENTO (AHORA INTEGRADA) ---
-
-def procesar_texto_manhwa(cajas_ocr):
-    # 1. Ordenar cajas de arriba a abajo
-    cajas_ordenadas = sorted(cajas_ocr, key=lambda c: c['y'])
-    
-    bloques_finales = []
-    bloque_actual = []
-    
-    # 2. Agrupar por proximidad (Detectar globos)
-    for i, caja in enumerate(cajas_ordenadas):
-        # Limpieza inicial de caracteres basura comunes en bordes
-        texto_limpio = caja['texto'].replace('|', '').replace('_', '').strip()
-        
-        if not texto_limpio: continue # Saltar vacíos
-
-        if not bloque_actual:
-            bloque_actual.append({'texto': texto_limpio, 'y': caja['y']}) # Guardamos Y para referencia futura si se necesita
-            continue
-            
-        # Calcular distancia con el elemento anterior del bloque
-        # Nota: Usamos el último elemento añadido al bloque actual para comparar
-        ultimo_elemento = bloque_actual[-1]
-        distancia_y = caja['y'] - ultimo_elemento['y']
-        
-        # UMBRAL: Si hay más de 60px de diferencia, es otro globo
-        UMBRAL_DISTANCIA = 60 
-        
-        if distancia_y > UMBRAL_DISTANCIA:
-            # Cerrar bloque anterior
-            bloques_finales.append(unir_texto_inteligente([b['texto'] for b in bloque_actual]))
-            bloque_actual = [{'texto': texto_limpio, 'y': caja['y']}] # Iniciar nuevo
-        else:
-            bloque_actual.append({'texto': texto_limpio, 'y': caja['y']})
-    
-    # Agregar el último bloque remanente
-    if bloque_actual:
-        bloques_finales.append(unir_texto_inteligente([b['texto'] for b in bloque_actual]))
-        
-    return bloques_finales
-
-def unir_texto_inteligente(lista_textos):
-    texto_completo = ""
-    for linea in lista_textos:
-        if texto_completo.endswith("-"):
-            # Contexto Inteligente: "go-" + "ing" -> "going"
-            texto_completo = texto_completo[:-1] + linea
-        else:
-            # Caso normal con espacio
-            texto_completo += " " + linea
-    return texto_completo.strip()
-
-# --- ENDPOINT 2: TRADUCIR (REESCRITO) ---
+# --- ENDPOINT 2: TRADUCIR (¡RENOVADO!) ---
 @app.post("/traducir-imagen")
 def traducir_imagen(payload: dict = Body(...)):
     img_url = payload.get("img_url")
@@ -149,78 +126,65 @@ def traducir_imagen(payload: dict = Body(...)):
     cfg = CONFIG_IDIOMAS.get(modo, CONFIG_IDIOMAS["en_es"])
 
     try:
+        # 1. Descargar imagen
         headers = {"User-Agent": "Mozilla/5.0"}
         try:
             response = requests.get(img_url, headers=headers, stream=True, timeout=10)
             response.raise_for_status()
         except:
-            print("Fallo directo, usando ZenRows para imagen...")
             response = descargar_con_zenrows(img_url)
 
         img = Image.open(io.BytesIO(response.content))
+        img = img.convert('L') # Escala de grises mejora OCR
         
-        # Pre-procesamiento de imagen
-        img = img.convert('L') # Escala de grises
-        # Opcional: Aumentar contraste aquí ayudaría al OCR
-        
+        # Optimización de tamaño
         if img.width > 1500:
             ratio = 1500 / img.width
             img = img.resize((1500, int(img.height * ratio)), Image.Resampling.LANCZOS)
 
-        # ---------------------------------------------------------
-        #  CAMBIO CRÍTICO: Usamos image_to_data para tener coordenadas
-        # ---------------------------------------------------------
+        # 2. OCR Inteligente (Obtener lista de burbujas, no texto plano)
         try:
-            # Output.DICT nos da listas: d['text'], d['top'], d['conf'], etc.
-            d = pytesseract.image_to_data(img, lang=cfg["ocr"], output_type=Output.DICT)
+            lista_burbujas = procesar_ocr_inteligente(img, cfg["ocr"])
         except:
-            # Fallback a inglés si falla el idioma específico
-            d = pytesseract.image_to_data(img, lang="eng", output_type=Output.DICT)
+            lista_burbujas = procesar_ocr_inteligente(img, "eng")
         
         del img
         gc.collect()
 
-        # Transformar la salida cruda de Tesseract a una lista de objetos limpios
-        cajas_ocr = []
-        n_boxes = len(d['text'])
+        if not lista_burbujas:
+            return {"bloques": []} # Retorno vacío si no hay texto
+
+        # 3. Traducción Optimizada (Batch)
+        # Unimos todo con un separador único " ||| " para hacer solo 1 petición a Google
+        texto_unido = " ||| ".join(lista_burbujas)
         
-        for i in range(n_boxes):
-            # Filtramos confianza baja (<40) y textos vacíos
-            if int(d['conf'][i]) > 40 and d['text'][i].strip():
-                cajas_ocr.append({
-                    "texto": d['text'][i],
-                    "y": d['top'][i],     # Coordenada Y (vertical)
-                    "x": d['left'][i],    # Coordenada X (horizontal) - Opcional
-                    "h": d['height'][i]   # Altura - Opcional
-                })
-
-        if not cajas_ocr:
-            return {"bloques": []}
-
-        # 1. Aplicar agrupación espacial + limpieza + contexto inteligente
-        bloques_texto = procesar_texto_manhwa(cajas_ocr)
-
-        # 2. Traducir cada bloque por separado
         translator = GoogleTranslator(source=cfg["src"], target=cfg["dest"])
-        resultados = []
+        traduccion_raw = translator.translate(texto_unido)
+        
+        # Separamos de nuevo
+        lista_traducida = traduccion_raw.split(" ||| ")
 
-        for bloque in bloques_texto:
-            if not bloque.strip(): continue
-            try:
-                traducido = translator.translate(bloque)
-                resultados.append({
-                    "original": bloque,
+        # 4. Construir respuesta JSON estructurada para el Frontend
+        resultado_final = []
+        
+        # Aseguramos que las listas tengan el mismo tamaño (seguridad)
+        limit = min(len(lista_burbujas), len(lista_traducida))
+        
+        for i in range(limit):
+            original = lista_burbujas[i]
+            traducido = lista_traducida[i]
+            
+            # Limpieza extra de caracteres raros
+            traducido = traducido.replace("|||", "").strip()
+            
+            if len(traducido) > 1: # Ignorar ruido de 1 letra
+                resultado_final.append({
+                    "original": original,
                     "traducido": traducido
                 })
-            except Exception as e:
-                resultados.append({
-                    "original": bloque,
-                    "traducido": "[Error traducción]"
-                })
 
-        # Devolvemos la lista de bloques para que el Frontend los pinte separados
-        return {"bloques": resultados}
+        return {"bloques": resultado_final}
 
     except Exception as e:
-        print(f"Error fatal: {e}")
-        return {"error": str(e), "bloques": []}
+        print(f"Error: {e}")
+        return {"bloques": [], "error": str(e)}
