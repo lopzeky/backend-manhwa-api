@@ -70,27 +70,30 @@ def procesar_ocr_inteligente(img, lang_ocr):
     
     return bloques
 
-# --- 2. DESCARGA CON ZENROWS (Configurado para Manhwas) ---
+# --- 2. DESCARGA CON ZENROWS (CORREGIDO ERROR 400) ---
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
-def descargar_con_zenrows(url, timeout=45):
-    # NOTA: En producción, mueve esta KEY a un archivo .env
+def descargar_con_zenrows(url, timeout=40):
+    # TU API KEY REAL
     API_KEY = "16ec4b42117e5328f574d7cf53b32bbbb17daa75" 
+    
     params = {
         "apikey": API_KEY,
         "url": url,
         "js_render": "true",
         "antibot": "true",
         "premium_proxy": "true",
-        "wait": "5000" # Aumentado a 5s para dar tiempo a imágenes pesadas
+        # AJUSTE CRÍTICO: Bajamos a 3000 para evitar timeout del servidor proxy
+        "wait": "3000" 
     }
     try:
+        print(f"📡 Conectando a ZenRows para: {url}...")
         response = requests.get("https://api.zenrows.com/v1/", params=params, timeout=timeout)
         return response
     except Exception as e:
-        print(f"Error ZenRows: {e}")
+        print(f"❌ Error interno ZenRows: {e}")
         raise e
 
-# --- ENDPOINT 1: ESCANEAR CAPÍTULO (Lógica Corregida) ---
+# --- ENDPOINT 1: ESCANEAR CAPÍTULO (CORREGIDO IMÁGENES GRISES) ---
 @app.post("/scan")
 def escanear_capitulo(payload: dict = Body(...)):
     url = payload.get("url")
@@ -99,14 +102,17 @@ def escanear_capitulo(payload: dict = Body(...)):
     print(f"🚀 Escaneando: {url}")
     try:
         response = descargar_con_zenrows(url)
-        if response.status_code != 200: 
-            raise HTTPException(status_code=400, detail="ZenRows falló al cargar la página")
+        
+        # Diagnóstico de errores HTTP de ZenRows
+        if response.status_code != 200:
+            print(f"⚠️ ZenRows Error {response.status_code}: {response.text}") 
+            raise HTTPException(status_code=400, detail=f"ZenRows falló: {response.text}")
 
         soup = BeautifulSoup(response.text, 'lxml')
         imagenes = []
 
-        # A. ESTRATEGIA DE CONTENEDORES
-        # Buscamos primero donde vive el cómic para ignorar el footer/sidebar
+        # A. ESTRATEGIA DE CONTENEDORES (Prioridad 1)
+        # Buscamos primero donde vive el cómic para ignorar el footer/comentarios
         contenedores_comunes = [
             'readerarea', 'chapter-content', 'reading-content', 'page-content', 
             'main-content', 'post-body', 'entry-content', 'vung_doc'
@@ -122,13 +128,18 @@ def escanear_capitulo(payload: dict = Body(...)):
         if not area_lectura:
             for clase in contenedores_comunes:
                 area_lectura = soup.find('div', class_=clase)
-                if area_lectura: break
+                if area_lectura: 
+                    print(f"✅ Contenedor encontrado: {clase}")
+                    break
         
-        # Si no encontramos contenedor, usamos todo el body (con cuidado)
+        # Si no encontramos contenedor, usamos todo el body pero con miedo
         target = area_lectura if area_lectura else soup
 
-        # B. FILTRADO DE IMÁGENES (Anti-Basura)
-        palabras_basura = ['logo', 'banner', 'ads', 'icon', 'avatar', 'comment', 'profile', 'recaptcha', 'gif', 'svg']
+        # B. FILTRADO DE IMÁGENES (Anti-Avatares y Anti-Logos)
+        palabras_basura = [
+            'logo', 'banner', 'ads', 'icon', 'avatar', 'gravatar', 'comment', 
+            'profile', 'recaptcha', 'gif', 'svg', 'author', 'share', 'facebook'
+        ]
 
         for img in target.find_all('img'):
             # Buscar la URL real en atributos lazy loading
@@ -141,22 +152,24 @@ def escanear_capitulo(payload: dict = Body(...)):
                 if any(x in src_lower for x in palabras_basura):
                     continue
                 
-                # Filtro 2: Dimensiones (Si el HTML dice que es pequeño, es basura)
+                # Filtro 2: Dimensiones HTML (Crucial para matar avatares de comentarios)
                 try:
-                    w = int(img.get('width', 1000))
-                    h = int(img.get('height', 1000))
-                    # Un panel de manhwa nunca es menor a 150px
-                    if w < 150 and h < 150: 
+                    w = int(img.get('width', 999))
+                    h = int(img.get('height', 999))
+                    # Un panel de manhwa nunca es menor a 200px. Un avatar suele ser 96x96.
+                    if w < 200 and h < 200: 
                         continue
                 except:
                     pass # Si no tiene dimensiones, asumimos que sirve
 
-                imagenes.append(src)
+                # Limpieza de URL (quitar ?resize=...)
+                src_clean = src.split('?')[0]
+                imagenes.append(src_clean)
 
-        # C. FALLBACK (Plan de Respaldo)
-        # Si la estrategia HTML falló y tenemos < 3 imágenes, buscamos enlaces crudos en el texto
-        if len(imagenes) < 3:
-            print("⚠️ Usando búsqueda Regex de respaldo...")
+        # C. FALLBACK (Plan de Respaldo - Regex)
+        # Si la estrategia HTML falló y no tenemos imágenes, buscamos enlaces crudos
+        if len(imagenes) == 0:
+            print("⚠️ HTML falló. Usando búsqueda Regex de respaldo...")
             patron = r'(https?://[^"\s\'>]+\.(?:jpg|jpeg|png|webp))'
             enlaces_raw = re.findall(patron, response.text)
             for link in enlaces_raw:
@@ -166,13 +179,17 @@ def escanear_capitulo(payload: dict = Body(...)):
         # Eliminar duplicados manteniendo orden
         imagenes_unicas = list(dict.fromkeys(imagenes))
         
+        print(f"📊 Total imágenes encontradas: {len(imagenes_unicas)}")
+
         if not imagenes_unicas:
              return {"status": "error", "message": "No se detectaron imágenes válidas. Sitio protegido o estructura desconocida."}
 
         return {"status": "ok", "total": len(imagenes_unicas), "imagenes": imagenes_unicas}
 
+    except HTTPException as he:
+        raise he
     except Exception as e:
-        print(f"Error crítico en scan: {str(e)}")
+        print(f"🔥 Error crítico en scan: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # --- ENDPOINT 2: TRADUCIR IMAGEN (Optimizado) ---
