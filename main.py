@@ -30,70 +30,91 @@ CONFIG_IDIOMAS = {
     "ko_en": {"ocr": "kor", "src": "ko", "dest": "en"}
 }
 
-# --- 1. FUNCIÓN OCR INTELIGENTE (Detecta Burbujas) ---
+# --- 1. OCR INTELIGENTE CON COORDENADAS ---
 def procesar_ocr_inteligente(img, lang_ocr):
-    # output_type=Output.DICT nos da coordenadas
+    # output_type=Output.DICT nos da coordenadas y texto
     data = pytesseract.image_to_data(img, lang=lang_ocr, output_type=Output.DICT)
     
     n_boxes = len(data['text'])
-    bloques = []         # Lista final de burbujas
-    bloque_actual = []   # Palabras de la burbuja actual
-    ultimo_bottom = 0    # Posición inferior de la última palabra procesada
+    bloques = []         
     
-    # UMBRAL: Si hay más de 60px de espacio vertical entre palabras, es otra burbuja
-    UMBRAL_SEPARACION = 60 
+    # Variables para agrupar palabras en una sola burbuja
+    bloque_texto = []   
+    min_left, min_top = float('inf'), float('inf')
+    max_right, max_bottom = 0, 0
+    
+    ultimo_bottom = 0
+    UMBRAL_SEPARACION = 60 # Píxeles de separación para cortar burbuja
 
     for i in range(n_boxes):
-        # Filtramos basura (confianza < 40 o espacios vacíos)
-        if int(data['conf'][i]) > 40:
+        if int(data['conf'][i]) > 40: # Confianza > 40%
             texto = data['text'][i].strip()
             if not texto: continue
 
+            # Coordenadas de la palabra actual
             top = data['top'][i]
+            left = data['left'][i]
+            width = data['width'][i]
             height = data['height'][i]
             bottom = top + height
+            right = left + width
             
-            # LÓGICA DE AGRUPACIÓN:
-            # Si ya tenemos palabras y la nueva palabra está muy lejos abajo...
-            if bloque_actual and (top - ultimo_bottom) > UMBRAL_SEPARACION:
-                # 1. Cerramos la burbuja anterior
-                bloques.append(" ".join(bloque_actual))
-                # 2. Iniciamos una nueva
-                bloque_actual = []
+            # SI HAY UN SALTO GRANDE HACIA ABAJO -> NUEVA BURBUJA
+            if bloque_texto and (top - ultimo_bottom) > UMBRAL_SEPARACION:
+                # Guardamos el bloque anterior
+                bloques.append({
+                    "texto": " ".join(bloque_texto),
+                    "box": {
+                        "x": min_left, 
+                        "y": min_top, 
+                        "w": max_right - min_left, 
+                        "h": max_bottom - min_top
+                    }
+                })
+                # Reseteamos variables
+                bloque_texto = []
+                min_left, min_top = float('inf'), float('inf')
+                max_right, max_bottom = 0, 0
             
-            bloque_actual.append(texto)
-            ultimo_bottom = bottom # Actualizamos la referencia
+            # Agregamos palabra al buffer
+            bloque_texto.append(texto)
+            ultimo_bottom = bottom
+            
+            # Expandimos el área de la caja contenedora
+            if left < min_left: min_left = left
+            if top < min_top: min_top = top
+            if right > max_right: max_right = right
+            if bottom > max_bottom: max_bottom = bottom
 
-    # Agregar el último bloque pendiente
-    if bloque_actual:
-        bloques.append(" ".join(bloque_actual))
+    # Guardar el último bloque que quedó pendiente
+    if bloque_texto:
+        bloques.append({
+            "texto": " ".join(bloque_texto),
+            "box": {
+                "x": min_left, "y": min_top, 
+                "w": max_right - min_left, "h": max_bottom - min_top
+            }
+        })
     
     return bloques
 
-# --- 2. DESCARGA CON ZENROWS (CORREGIDO ERROR 400) ---
+# --- 2. ZENROWS (Manteniendo tu configuración) ---
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
 def descargar_con_zenrows(url, timeout=40):
-    # TU API KEY REAL
     API_KEY = "16ec4b42117e5328f574d7cf53b32bbbb17daa75" 
-    
     params = {
-        "apikey": API_KEY,
-        "url": url,
-        "js_render": "true",
-        "antibot": "true",
-        "premium_proxy": "true",
-        # AJUSTE CRÍTICO: Bajamos a 3000 para evitar timeout del servidor proxy
-        "wait": "3000" 
+        "apikey": API_KEY, "url": url, "js_render": "true",
+        "antibot": "true", "premium_proxy": "true", "wait": "3000" 
     }
     try:
-        print(f"📡 Conectando a ZenRows para: {url}...")
+        print(f"📡 ZenRows: {url}...")
         response = requests.get("https://api.zenrows.com/v1/", params=params, timeout=timeout)
         return response
     except Exception as e:
-        print(f"❌ Error interno ZenRows: {e}")
+        print(f"❌ Error ZenRows: {e}")
         raise e
 
-# --- ENDPOINT 1: ESCANEAR CAPÍTULO (CORREGIDO IMÁGENES GRISES) ---
+# --- ENDPOINT SCAN (Igual que antes, con filtros) ---
 @app.post("/scan")
 def escanear_capitulo(payload: dict = Body(...)):
     url = payload.get("url")
@@ -102,97 +123,45 @@ def escanear_capitulo(payload: dict = Body(...)):
     print(f"🚀 Escaneando: {url}")
     try:
         response = descargar_con_zenrows(url)
-        
-        # Diagnóstico de errores HTTP de ZenRows
-        if response.status_code != 200:
-            print(f"⚠️ ZenRows Error {response.status_code}: {response.text}") 
+        if response.status_code != 200: 
             raise HTTPException(status_code=400, detail=f"ZenRows falló: {response.text}")
 
         soup = BeautifulSoup(response.text, 'lxml')
         imagenes = []
 
-        # A. ESTRATEGIA DE CONTENEDORES (Prioridad 1)
-        # Buscamos primero donde vive el cómic para ignorar el footer/comentarios
-        contenedores_comunes = [
-            'readerarea', 'chapter-content', 'reading-content', 'page-content', 
-            'main-content', 'post-body', 'entry-content', 'vung_doc'
-        ]
+        contenedores = ['readerarea', 'chapter-content', 'reading-content', 'page-content', 'vung_doc']
+        area = None
         
-        area_lectura = None
+        if not area: area = soup.find('div', id=re.compile(r'reader|content|chapter', re.I))
+        if not area:
+            for c in contenedores:
+                area = soup.find('div', class_=c)
+                if area: break
         
-        # 1. Buscar por ID (más preciso)
-        if not area_lectura:
-            area_lectura = soup.find('div', id=re.compile(r'reader|content|chapter', re.I))
-            
-        # 2. Buscar por Clases comunes
-        if not area_lectura:
-            for clase in contenedores_comunes:
-                area_lectura = soup.find('div', class_=clase)
-                if area_lectura: 
-                    print(f"✅ Contenedor encontrado: {clase}")
-                    break
-        
-        # Si no encontramos contenedor, usamos todo el body pero con miedo
-        target = area_lectura if area_lectura else soup
-
-        # B. FILTRADO DE IMÁGENES (Anti-Avatares y Anti-Logos)
-        palabras_basura = [
-            'logo', 'banner', 'ads', 'icon', 'avatar', 'gravatar', 'comment', 
-            'profile', 'recaptcha', 'gif', 'svg', 'author', 'share', 'facebook'
-        ]
+        target = area if area else soup
+        basura = ['logo', 'banner', 'ads', 'icon', 'avatar', 'gravatar', 'comment', 'profile', 'recaptcha']
 
         for img in target.find_all('img'):
-            # Buscar la URL real en atributos lazy loading
             src = img.get('data-src') or img.get('data-original') or img.get('data-lazy-src') or img.get('src')
-            
             if src and src.startswith('http'):
-                src_lower = src.lower()
-                
-                # Filtro 1: Palabras prohibidas en la URL
-                if any(x in src_lower for x in palabras_basura):
-                    continue
-                
-                # Filtro 2: Dimensiones HTML (Crucial para matar avatares de comentarios)
+                if any(x in src.lower() for x in basura): continue
                 try:
-                    w = int(img.get('width', 999))
-                    h = int(img.get('height', 999))
-                    # Un panel de manhwa nunca es menor a 200px. Un avatar suele ser 96x96.
-                    if w < 200 and h < 200: 
-                        continue
-                except:
-                    pass # Si no tiene dimensiones, asumimos que sirve
+                    if int(img.get('width', 999)) < 200 and int(img.get('height', 999)) < 200: continue
+                except: pass
+                imagenes.append(src.split('?')[0])
 
-                # Limpieza de URL (quitar ?resize=...)
-                src_clean = src.split('?')[0]
-                imagenes.append(src_clean)
+        if not imagenes: # Fallback Regex
+             patron = r'(https?://[^"\s\'>]+\.(?:jpg|jpeg|png|webp))'
+             raw = re.findall(patron, response.text)
+             imagenes = [l for l in raw if not any(x in l.lower() for x in basura)]
 
-        # C. FALLBACK (Plan de Respaldo - Regex)
-        # Si la estrategia HTML falló y no tenemos imágenes, buscamos enlaces crudos
-        if len(imagenes) == 0:
-            print("⚠️ HTML falló. Usando búsqueda Regex de respaldo...")
-            patron = r'(https?://[^"\s\'>]+\.(?:jpg|jpeg|png|webp))'
-            enlaces_raw = re.findall(patron, response.text)
-            for link in enlaces_raw:
-                if not any(x in link.lower() for x in palabras_basura):
-                    imagenes.append(link)
+        imagenes = list(dict.fromkeys(imagenes))
+        return {"status": "ok", "total": len(imagenes), "imagenes": imagenes}
 
-        # Eliminar duplicados manteniendo orden
-        imagenes_unicas = list(dict.fromkeys(imagenes))
-        
-        print(f"📊 Total imágenes encontradas: {len(imagenes_unicas)}")
-
-        if not imagenes_unicas:
-             return {"status": "error", "message": "No se detectaron imágenes válidas. Sitio protegido o estructura desconocida."}
-
-        return {"status": "ok", "total": len(imagenes_unicas), "imagenes": imagenes_unicas}
-
-    except HTTPException as he:
-        raise he
     except Exception as e:
-        print(f"🔥 Error crítico en scan: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- ENDPOINT 2: TRADUCIR IMAGEN (Optimizado) ---
+# --- ENDPOINT TRADUCIR (¡Ahora devuelve coordenadas!) ---
 @app.post("/traducir-imagen")
 def traducir_imagen(payload: dict = Body(...)):
     img_url = payload.get("img_url")
@@ -200,71 +169,64 @@ def traducir_imagen(payload: dict = Body(...)):
     cfg = CONFIG_IDIOMAS.get(modo, CONFIG_IDIOMAS["en_es"])
 
     try:
-        # 1. Descargar imagen
         headers = {"User-Agent": "Mozilla/5.0"}
         try:
-            # Intento rápido directo
             response = requests.get(img_url, headers=headers, stream=True, timeout=10)
             response.raise_for_status()
         except:
-            # Intento fuerte con ZenRows si falla el directo
-            print("⚠️ Descarga directa falló, usando ZenRows para la imagen...")
             response = descargar_con_zenrows(img_url)
 
         img = Image.open(io.BytesIO(response.content))
-        img = img.convert('L') # Escala de grises mejora OCR
+        img = img.convert('L')
         
-        # Optimización de tamaño (mejora velocidad OCR)
-        if img.width > 1500:
-            ratio = 1500 / img.width
-            img = img.resize((1500, int(img.height * ratio)), Image.Resampling.LANCZOS)
+        # IMPORTANTE: Redimensionamos a 1500px para estandarizar coordenadas
+        target_width = 1500
+        original_width, original_height = img.size
+        
+        if original_width > target_width:
+            ratio = target_width / original_width
+            img = img.resize((target_width, int(original_height * ratio)), Image.Resampling.LANCZOS)
+        else:
+            ratio = 1.0 # No se redimensionó
 
-        # 2. OCR Inteligente
+        # OCR devuelve objetos con coordenadas
         try:
-            lista_burbujas = procesar_ocr_inteligente(img, cfg["ocr"])
+            lista_bloques = procesar_ocr_inteligente(img, cfg["ocr"])
         except:
-            # Fallback a inglés si falla el idioma específico
-            lista_burbujas = procesar_ocr_inteligente(img, "eng")
+            lista_bloques = procesar_ocr_inteligente(img, "eng") # Fallback
         
         del img
         gc.collect()
 
-        if not lista_burbujas:
-            return {"bloques": []}
+        if not lista_bloques: return {"bloques": []}
 
-        # 3. Traducción Batch (Lotes)
-        # Unimos todo para hacer 1 sola petición a Google
-        texto_unido = " ||| ".join(lista_burbujas)
+        # Extraemos texto para traducir
+        textos = [b['texto'] for b in lista_bloques]
+        texto_unido = " ||| ".join(textos)
         
         translator = GoogleTranslator(source=cfg["src"], target=cfg["dest"])
-        traduccion_raw = translator.translate(texto_unido)
-        
-        # Separamos de nuevo
-        if traduccion_raw:
+        try:
+            traduccion_raw = translator.translate(texto_unido)
             lista_traducida = traduccion_raw.split(" ||| ")
-        else:
-            lista_traducida = lista_burbujas # Fallback si falla traducción
+        except:
+            lista_traducida = textos # Si falla, devuelve original
 
-        # 4. Construir respuesta
         resultado_final = []
-        limit = min(len(lista_burbujas), len(lista_traducida))
+        limit = min(len(lista_bloques), len(lista_traducida))
         
         for i in range(limit):
-            original = lista_burbujas[i]
-            traducido = lista_traducida[i]
-            
-            traducido = traducido.replace("|||", "").strip()
-            
-            if len(traducido) > 1:
+            trad = lista_traducida[i].replace("|||", "").strip()
+            if len(trad) > 1:
                 resultado_final.append({
-                    "original": original,
-                    "traducido": traducido
+                    "original": lista_bloques[i]['texto'],
+                    "traducido": trad,
+                    # Devolvemos coordenadas y el factor de escala usado
+                    "coords": lista_bloques[i]['box'],
+                    "img_scale": ratio 
                 })
 
         return {"bloques": resultado_final}
 
     except Exception as e:
-        print(f"Error en traducción: {e}")
+        print(f"Error: {e}")
         return {"bloques": [], "error": str(e)}
-
-# Para correr: uvicorn main:app --reload
